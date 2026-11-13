@@ -1,0 +1,7 @@
+# Optional digital-twin visualization, web UI, retrieval, and voice integrations.
+torch>=2.0
+dtaidistance>=2.3
+plotly>=5.0
+streamlit>=1.30
+chromadb>=0.4
+pyttsx3>=2.90

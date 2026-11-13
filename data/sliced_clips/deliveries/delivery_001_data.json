@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "delivery_id": "delivery_001",
+  "video_path": "C:\\Users\\srip4\\Cricket-Project-\\data\\sliced_clips\\deliveries\\delivery_001.mp4",
+  "original_fps": 29.97002997002997,
+  "start_frame": 0,
+  "trigger_frame": 0,
+  "frame_count": 182,
+  "trigger_method": "short_clip_fallback",
+  "calibration_matrix_path": "C:\\Users\\srip4\\Cricket-Project-\\data\\sliced_clips\\pitch_homography.npy",
+  "calibration_status": "calibrated",
+  "phase_status": {
+    "capture": "complete",
+    "tracking_pose": "2d_only_no_lifter_configured",
+    "tracking_ball": "unavailable",
+    "event_detection": "estimated_candidates",
+    "biomechanics": "complete",
+    "injury_screen": "complete",
+    "visualization": "unavailable",
+    "ball_physics": "partial",
+    "coach": "complete"
+  },
+  "arrays_path": "C:\\Users\\srip4\\Cricket-Project-\\data\\sliced_clips\\deliveries\\delivery_001_data_arrays.npz",
+  "pose_frame_count": 182,
+  "pose_status": "2d_only_no_lifter_configured",
+  "ball_tracking": {
+    "status": "unavailable",
+    "bounce_fit": {
+      "status": "insufficient_detections",
+      "frame": null,
+      "time_sec": null,
+      "x_pixels": null,
+      "fit_rmse_pixels": null
+    }
+  },
+  "events": {
+    "status": "estimated_candidates",
+    "events": {
+      "BFC": {
+        "frame": 172,
+        "time_sec": 5.739066666666667,
+        "confidence": 1.0,
+        "method": "peak ankle speed before FFC proxy"
+      },
+      "FFC": {
+        "frame": 172,
+        "time_sec": 5.739066666666667,
+        "confidence": 1.0,
+        "method": "peak ankle image-space speed proxy",
+        "lead_foot_index": 1
+      },
+      "release": {
+        "frame": 172,
+        "time_sec": 5.739066666666667,
+        "confidence": 0.0,
+        "method": "peak wrist image-space speed candidate"
+      }
+    }
+  },
+  "biomechanics": {
+    "knee_angle_deg": {
+      "min": null,
+      "mean": null,
+      "max": null
+    },
+    "elbow_angle_deg": {
+      "min": null,
+      "mean": null,
+      "max": null
+    },
+    "trunk_tilt_deg": {
+      "min": null,
+      "mean": null,
+      "max": null
+    },
+    "knee_brace_warning": null,
+    "trunk_tilt_warning": null,
+    "elbow_extension_screen": null,
+    "interpretation_note": "Screening estimates only; camera calibration and validated 3D pose are required for meaningful biomechanics."
+  },
+  "injury_screen": {
+    "hip_shoulder_separation_peak_deg": null,
+    "separation_warning": null,
+    "mixed_action_screen": null,
+    "status": "screening_only_not_medical_advice"
+  },
+  "digital_twin_visualization": {
+    "status": "unavailable",
+    "reason": "This frame lacks complete 3D coordinates."
+  },
+  "ball_physics": {
+    "release_speed_kmh": null,
+    "pitch_track_status": "image_to_ground_plane_projection_only",
+    "bounce_pitch_zone_candidate": {
+      "status": "unavailable",
+      "x_m": null,
+      "y_m": null
+    },
+    "note": "A ground-plane homography cannot recover airborne ball depth or metric release speed."
+  },
+  "coach": {
+    "feedback": "No configured screening threshold was conclusively crossed; review the clip and confirm the pose estimate.",
+    "observations": [
+      "No configured screening threshold was conclusively crossed; review the clip and confirm the pose estimate."
+    ],
+    "retrieved_context": [],
+    "generated_by": "deterministic_local_rules",
+    "safety_note": "Automated video estimates are coaching aids, not medical advice or an official bowling-action legality assessment."
+  }
+}
