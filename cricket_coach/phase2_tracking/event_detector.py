@@ -65,6 +65,7 @@ class EventDetector:
             raise ValueError("Pose arrays are missing; run pose extraction first.")
         result = self.detect(arrays["poses_2d"], float(metadata["original_fps"]))
         metadata["events"] = result
+        metadata["event_detection"] = result
         metadata["phase_status"] = {**metadata.get("phase_status", {}), "event_detection": result["status"]}
         save_phase_payload(metadata_path, metadata, arrays)
         return metadata, arrays

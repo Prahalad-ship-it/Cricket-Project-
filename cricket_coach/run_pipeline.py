@@ -56,45 +56,50 @@ def run_pipeline(
     ball_analyzer = ball_tracker or BallTracker()
     coach_module = coach or RAGCoach()
     results: list[dict[str, Any]] = []
-    for clip_path in clip_paths:
-        metadata_path = clip_path.with_name(f"{clip_path.stem}_data.json")
-        metadata: dict[str, Any] = {"delivery_id": clip_path.stem, "video_path": str(clip_path.resolve())}
-        try:
-            if pose_analyzer is None:
-                pose_analyzer = Pose3DProcessor()
-            metadata, arrays = pose_analyzer.process(clip_path, metadata_path)
-            metadata, arrays = ball_analyzer.track(clip_path, metadata_path)
-            if "poses_2d" in arrays:
-                EventDetector().process(metadata_path)
-            if "poses_3d" in arrays:
-                KinematicsAnalyzer().process(metadata_path)
-                InjuryRiskAnalyzer().process(metadata_path)
+    try:
+        for clip_path in clip_paths:
+            metadata_path = clip_path.with_name(f"{clip_path.stem}_data.json")
+            metadata: dict[str, Any] = {"delivery_id": clip_path.stem, "video_path": str(clip_path.resolve())}
+            try:
+                if pose_analyzer is None:
+                    pose_analyzer = Pose3DProcessor()
+                metadata, arrays = pose_analyzer.process(clip_path, metadata_path)
+                metadata, arrays = ball_analyzer.track(clip_path, metadata_path)
+                if "poses_2d" in arrays:
+                    EventDetector().process(metadata_path)
+                if "poses_3d" in arrays:
+                    KinematicsAnalyzer().process(metadata_path)
+                    InjuryRiskAnalyzer().process(metadata_path)
+                    metadata, arrays = load_phase_payload(metadata_path)
+                    if reference_path:
+                        reference = ProComparator.load_reference(reference_path)
+                        comparison = ProComparator().compare(arrays["poses_3d"], reference)
+                        metadata["pro_comparison"] = comparison
+                        metadata["phase_status"] = {**metadata.get("phase_status", {}), "pro_comparison": "complete"}
+                        save_phase_payload(metadata_path, metadata, arrays)
+                    try:
+                        visual_path = paths.output_dir / "digital_twin" / f"{clip_path.stem}_pose.html"
+                        SkeletonVisualizer().export_html(arrays["poses_3d"], visual_path)
+                        metadata["digital_twin_visualization"] = str(visual_path.resolve())
+                        metadata["phase_status"] = {**metadata.get("phase_status", {}), "visualization": "complete"}
+                        save_phase_payload(metadata_path, metadata, arrays)
+                    except (ImportError, ValueError) as error:
+                        metadata["digital_twin_visualization"] = {"status": "unavailable", "reason": str(error)}
+                        metadata["phase_status"] = {**metadata.get("phase_status", {}), "visualization": "unavailable"}
+                        save_phase_payload(metadata_path, metadata, arrays)
+                BallPhysicsAnalyzer().process(metadata_path)
+                coach_module.process(metadata_path)
+                metadata, _ = load_phase_payload(metadata_path)
+            except ImportError as error:
                 metadata, arrays = load_phase_payload(metadata_path)
-                if reference_path:
-                    reference = ProComparator.load_reference(reference_path)
-                    comparison = ProComparator().compare(arrays["poses_3d"], reference)
-                    metadata["pro_comparison"] = comparison
-                    metadata["phase_status"] = {**metadata.get("phase_status", {}), "pro_comparison": "complete"}
-                    save_phase_payload(metadata_path, metadata, arrays)
-                try:
-                    visual_path = paths.output_dir / "digital_twin" / f"{clip_path.stem}_pose.html"
-                    SkeletonVisualizer().export_html(arrays["poses_3d"], visual_path)
-                    metadata["digital_twin_visualization"] = str(visual_path.resolve())
-                    metadata["phase_status"] = {**metadata.get("phase_status", {}), "visualization": "complete"}
-                    save_phase_payload(metadata_path, metadata, arrays)
-                except (ImportError, ValueError) as error:
-                    metadata["digital_twin_visualization"] = {"status": "unavailable", "reason": str(error)}
-                    metadata["phase_status"] = {**metadata.get("phase_status", {}), "visualization": "unavailable"}
-                    save_phase_payload(metadata_path, metadata, arrays)
-            BallPhysicsAnalyzer().process(metadata_path)
-            coach_module.process(metadata_path)
-            metadata, _ = load_phase_payload(metadata_path)
-        except ImportError as error:
-            metadata, arrays = load_phase_payload(metadata_path)
-            metadata["analysis_warning"] = str(error)
-            metadata["phase_status"] = {**metadata.get("phase_status", {}), "analysis": "dependency_unavailable"}
-            save_phase_payload(metadata_path, metadata, arrays)
-        results.append(metadata)
+                metadata["analysis_warning"] = str(error)
+                metadata["phase_status"] = {**metadata.get("phase_status", {}), "analysis": "dependency_unavailable"}
+                save_phase_payload(metadata_path, metadata, arrays)
+            results.append(metadata)
+    finally:
+        close_pose_analyzer = getattr(pose_analyzer, "close", None)
+        if callable(close_pose_analyzer):
+            close_pose_analyzer()
     return {
         "video_path": str(source.resolve()),
         "calibration_matrix_path": str(paths.calibration_matrix.resolve()),

@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from cricket_coach.config import POSE_CONFIDENCE_THRESHOLD
 from cricket_coach.data_contract import load_phase_payload
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -56,13 +57,28 @@ def _format_metric(value: Any, suffix: str = "") -> str:
     return "N/A"
 
 
-def _render_skeleton(st: Any, arrays: dict[str, np.ndarray]) -> None:
+def _render_skeleton(st: Any, arrays: dict[str, np.ndarray], selected_frame: int = 0) -> None:
     """Render the best available 3D pose, falling back to a clearly labeled 2D view."""
     poses_3d = arrays.get("poses_3d")
-    if poses_3d is not None and poses_3d.ndim == 3 and poses_3d.shape[1] >= 17 and poses_3d.shape[2] >= 3:
-        available = np.isfinite(poses_3d[..., :3]).all(axis=2).sum(axis=1)
-        frame_index = int(np.argmax(available)) if len(available) else 0
-        frame = poses_3d[frame_index, :, :3]
+    if (
+        poses_3d is not None
+        and poses_3d.ndim == 3
+        and len(poses_3d)
+        and poses_3d.shape[1] >= 17
+        and poses_3d.shape[2] >= 3
+    ):
+        pose_points = poses_3d[..., :3].copy()
+        if poses_3d.shape[2] >= 4:
+            low_confidence = (
+                ~np.isfinite(poses_3d[..., 3])
+                | (poses_3d[..., 3] < POSE_CONFIDENCE_THRESHOLD)
+            )
+            pose_points[low_confidence] = np.nan
+        available = np.isfinite(pose_points).all(axis=2).sum(axis=1)
+        frame_index = min(max(selected_frame, 0), len(available) - 1) if len(available) else 0
+        if len(available) and int(available[frame_index]) < 3:
+            frame_index = int(np.argmax(available))
+        frame = pose_points[frame_index]
         if int(available[frame_index]) >= 3:
             _render_3d_pose(st, frame, frame_index, len(poses_3d))
             return
@@ -71,14 +87,23 @@ def _render_skeleton(st: Any, arrays: dict[str, np.ndarray]) -> None:
     if poses_2d is None or poses_2d.ndim != 3 or poses_2d.shape[1] < 17 or poses_2d.shape[2] < 2:
         st.info("No pose landmarks are available for a skeleton view.")
         return
-    available = np.isfinite(poses_2d[..., :2]).all(axis=-1).sum(axis=1)
+    pose_points_2d = poses_2d[..., :2].copy()
+    if poses_2d.shape[2] >= 3:
+        low_confidence = (
+            ~np.isfinite(poses_2d[..., 2])
+            | (poses_2d[..., 2] < POSE_CONFIDENCE_THRESHOLD)
+        )
+        pose_points_2d[low_confidence] = np.nan
+    available = np.isfinite(pose_points_2d).all(axis=-1).sum(axis=1)
     if not len(available) or int(np.max(available)) < 3:
-        st.info("Pose landmarks are unavailable. A trained pose model is needed for a skeleton preview.")
+        st.info("Pose landmarks are unavailable for a skeleton preview.")
         return
-    frame_index = int(np.argmax(available))
-    _render_2d_pose(st, poses_2d[frame_index, :, :2], frame_index, len(poses_2d))
+    frame_index = min(max(selected_frame, 0), len(available) - 1)
+    if int(available[frame_index]) < 3:
+        frame_index = int(np.argmax(available))
+    _render_2d_pose(st, pose_points_2d[frame_index], frame_index, len(poses_2d))
     st.caption(
-        "Showing a 2D pose preview. A validated 3D pose-lifting model is required for a real 3D skeleton."
+        "Showing a 2D pose preview because 3D landmarks were unavailable for this delivery."
     )
 
 
@@ -192,16 +217,92 @@ def _render_dashboard(st: Any, metadata_path: Path) -> None:
     else:
         st.warning(f"Delivery video was not found beside its metadata: {video_path}")
 
+    pose_frames = arrays.get("poses_3d")
+    if pose_frames is None or pose_frames.ndim != 3:
+        pose_frames = arrays.get("poses_2d")
+    selected_frame = 0
+    if pose_frames is not None and pose_frames.ndim == 3 and len(pose_frames):
+        suggested_frame = metadata.get("biomechanics", {}).get("peak_wrist_speed_frame", 0)
+        if not isinstance(suggested_frame, (int, float, np.number)) or not np.isfinite(suggested_frame):
+            angle_series = arrays.get("joint_angles_deg")
+            suggested_frame = (
+                int(np.argmax(np.isfinite(angle_series).sum(axis=1)))
+                if angle_series is not None and angle_series.ndim == 2 and len(angle_series)
+                else 0
+            )
+        default_frame = min(max(int(suggested_frame), 0), len(pose_frames) - 1)
+        selected_frame = st.slider(
+            "Pose and angle frame",
+            min_value=1,
+            max_value=len(pose_frames),
+            value=default_frame + 1,
+            key=f"pose-frame-{delivery_id}",
+        ) - 1
+
     st.subheader("Biomechanics")
     biomechanics = metadata.get("biomechanics", {})
-    metric_columns = st.columns(3)
-    metrics = (
-        ("Knee angle · minimum", biomechanics.get("knee_angle_deg", {}).get("min"), "°"),
-        ("Elbow angle · minimum", biomechanics.get("elbow_angle_deg", {}).get("min"), "°"),
-        ("Trunk tilt · maximum", biomechanics.get("trunk_tilt_deg", {}).get("max"), "°"),
-    )
+    angle_series = arrays.get("joint_angles_deg")
+    if angle_series is not None and angle_series.ndim == 2 and selected_frame < len(angle_series):
+        front_leg = biomechanics.get("front_leg", "left")
+        bowling_arm = biomechanics.get("bowling_arm", "right")
+        knee_index = 0 if front_leg == "left" else 1
+        elbow_index = 2 if bowling_arm == "left" else 3
+        knee_value = angle_series[selected_frame, knee_index]
+        elbow_value = angle_series[selected_frame, elbow_index]
+        trunk_value = angle_series[selected_frame, 4] if angle_series.shape[1] > 4 else np.nan
+        knee_summary = biomechanics.get("front_knee_angle_deg", biomechanics.get("knee_angle_deg", {}))
+        elbow_summary = biomechanics.get("bowling_elbow_angle_deg", biomechanics.get("elbow_angle_deg", {}))
+        trunk_summary = biomechanics.get("lateral_trunk_tilt_deg", biomechanics.get("trunk_tilt_deg", {}))
+        extension_summary = biomechanics.get("bowling_elbow_extension_deg", {})
+        knee_label = f"{front_leg.title()} knee · frame angle"
+        elbow_label = f"{bowling_arm.title()} elbow · frame angle"
+        trunk_label = "Lateral trunk tilt · frame"
+        extension_label = "Elbow extension · frame estimate"
+        if not np.isfinite(knee_value):
+            knee_value = knee_summary.get("min")
+            knee_label = f"{front_leg.title()} knee · window minimum"
+        if not np.isfinite(elbow_value):
+            elbow_value = elbow_summary.get("min")
+            elbow_label = f"{bowling_arm.title()} elbow · window minimum"
+        if not np.isfinite(trunk_value):
+            trunk_value = trunk_summary.get("max")
+            trunk_label = "Lateral trunk tilt · window maximum"
+        extension_value = 180.0 - elbow_value if isinstance(elbow_value, (int, float, np.number)) and np.isfinite(elbow_value) else extension_summary.get("max")
+        if not np.isfinite(angle_series[selected_frame, elbow_index]):
+            extension_label = "Elbow extension · window maximum"
+        metrics = (
+            (knee_label, knee_value, "°"),
+            (elbow_label, elbow_value, "°"),
+            (trunk_label, trunk_value, "°"),
+            (extension_label, extension_value, "°"),
+        )
+    else:
+        knee = biomechanics.get("front_knee_angle_deg", biomechanics.get("knee_angle_deg", {}))
+        elbow = biomechanics.get("bowling_elbow_angle_deg", biomechanics.get("elbow_angle_deg", {}))
+        trunk = biomechanics.get("lateral_trunk_tilt_deg", biomechanics.get("trunk_tilt_deg", {}))
+        extension = biomechanics.get("bowling_elbow_extension_deg", {})
+        metrics = (
+            ("Front knee · window minimum", knee.get("min"), "°"),
+            ("Bowling elbow · window minimum", elbow.get("min"), "°"),
+            ("Lateral trunk tilt · window maximum", trunk.get("max"), "°"),
+            ("Elbow extension · window maximum", extension.get("max"), "°"),
+        )
+    metric_columns = st.columns(len(metrics))
     for column, (label, value, suffix) in zip(metric_columns, metrics):
         column.metric(label, _format_metric(value, suffix))
+    window = biomechanics.get("analysis_window", {})
+    if window:
+        method = {
+            "exact_contact_frames": "Exact contact frames",
+            "peak_wrist_speed": "10-frame peak-wrist fallback",
+            "best_pose_visibility": "10-frame best-pose fallback (no valid wrist-speed peak)",
+        }.get(window.get("selection_method"), "Biomechanics analysis window")
+        st.caption(
+            f"{method}; frames {window.get('start_frame', 'N/A')}–"
+            f"{max(window.get('start_frame', 0), window.get('end_frame_exclusive', 1) - 1)} | "
+            f"front leg: {biomechanics.get('front_leg', 'unknown')} | "
+            f"bowling arm: {biomechanics.get('bowling_arm', 'unknown')}"
+        )
     if biomechanics.get("interpretation_note"):
         st.caption(biomechanics["interpretation_note"])
 
@@ -224,9 +325,19 @@ def _render_dashboard(st: Any, metadata_path: Path) -> None:
 
     st.subheader("Coach feedback")
     coach = metadata.get("coach", {})
-    feedback = coach.get("feedback")
-    if feedback:
-        st.info(feedback)
+    report = coach.get("report", coach.get("feedback"))
+    if isinstance(report, dict):
+        sections = (
+            ("Root-cause diagnosis", "root_cause_diagnosis"),
+            ("#1 Priority fix", "priority_fix"),
+            ("Prescribed net drill", "prescribed_net_drill"),
+        )
+        for heading, key in sections:
+            st.markdown(f"**{heading}**")
+            st.info(report.get(key) or "No coaching guidance was returned for this section.")
+        st.caption(f"Generated by: {coach.get('generated_by', 'unknown')}")
+    elif report:
+        st.info(report)
     else:
         st.info("Coaching feedback has not been generated for this delivery.")
     observations = coach.get("observations") or []
@@ -238,18 +349,7 @@ def _render_dashboard(st: Any, metadata_path: Path) -> None:
         st.caption(coach["safety_note"])
 
     st.subheader("3D digital twin")
-    visualization = metadata.get("digital_twin_visualization")
-    if isinstance(visualization, str):
-        visual_path = Path(visualization)
-        if visual_path.is_file():
-            try:
-                import streamlit.components.v1 as components
-
-                components.html(visual_path.read_text(encoding="utf-8"), height=560, scrolling=True)
-            except OSError as error:
-                st.warning(f"Could not load saved 3D view: {error}")
-            return
-    _render_skeleton(st, arrays)
+    _render_skeleton(st, arrays, selected_frame)
 
 
 def main() -> None:
@@ -278,6 +378,7 @@ def main() -> None:
         delivery_files,
         index=default_index,
         format_func=lambda path: path.name.removesuffix("_data.json"),
+        key=f"delivery-{delivery_dir.resolve()}",
     )
     _render_dashboard(st, selected_file)
 

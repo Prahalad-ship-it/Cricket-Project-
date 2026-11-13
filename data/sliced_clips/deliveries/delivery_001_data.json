@@ -11,18 +11,19 @@
   "calibration_status": "calibrated",
   "phase_status": {
     "capture": "complete",
-    "tracking_pose": "2d_only_no_lifter_configured",
+    "tracking_pose": "mediapipe_world_landmarks",
     "tracking_ball": "unavailable",
     "event_detection": "estimated_candidates",
     "biomechanics": "complete",
     "injury_screen": "complete",
-    "visualization": "unavailable",
+    "visualization": "complete",
     "ball_physics": "partial",
     "coach": "complete"
   },
   "arrays_path": "C:\\Users\\srip4\\Cricket-Project-\\data\\sliced_clips\\deliveries\\delivery_001_data_arrays.npz",
   "pose_frame_count": 182,
-  "pose_status": "2d_only_no_lifter_configured",
+  "pose_3d_valid_frame_count": 172,
+  "pose_status": "mediapipe_world_landmarks",
   "ball_tracking": {
     "status": "unavailable",
     "bounce_fit": {
@@ -57,37 +58,95 @@
       }
     }
   },
+  "event_detection": {
+    "status": "estimated_candidates",
+    "events": {
+      "BFC": {
+        "frame": 172,
+        "time_sec": 5.739066666666667,
+        "confidence": 1.0,
+        "method": "peak ankle speed before FFC proxy"
+      },
+      "FFC": {
+        "frame": 172,
+        "time_sec": 5.739066666666667,
+        "confidence": 1.0,
+        "method": "peak ankle image-space speed proxy",
+        "lead_foot_index": 1
+      },
+      "release": {
+        "frame": 172,
+        "time_sec": 5.739066666666667,
+        "confidence": 0.0,
+        "method": "peak wrist image-space speed candidate"
+      }
+    }
+  },
   "biomechanics": {
     "knee_angle_deg": {
-      "min": null,
-      "mean": null,
-      "max": null
+      "min": 124.4629898071289,
+      "mean": 149.16488647460938,
+      "max": 161.04922485351562
     },
     "elbow_angle_deg": {
-      "min": null,
-      "mean": null,
-      "max": null
+      "min": 108.75079345703125,
+      "mean": 117.21818542480469,
+      "max": 123.49838256835938
     },
     "trunk_tilt_deg": {
-      "min": null,
-      "mean": null,
-      "max": null
+      "min": 0.34829792380332947,
+      "mean": 2.4671175479888916,
+      "max": 3.9332802295684814
     },
-    "knee_brace_warning": null,
-    "trunk_tilt_warning": null,
-    "elbow_extension_screen": null,
-    "interpretation_note": "Screening estimates only; camera calibration and validated 3D pose are required for meaningful biomechanics."
+    "front_knee_angle_deg": {
+      "min": 124.4629898071289,
+      "mean": 149.16488647460938,
+      "max": 161.04922485351562
+    },
+    "bowling_elbow_angle_deg": {
+      "min": 108.75079345703125,
+      "mean": 117.21818542480469,
+      "max": 123.49838256835938
+    },
+    "bowling_elbow_extension_deg": {
+      "min": 56.501617431640625,
+      "mean": 62.78180694580078,
+      "max": 71.24920654296875
+    },
+    "lateral_trunk_tilt_deg": {
+      "min": 0.34829792380332947,
+      "mean": 2.4671175479888916,
+      "max": 3.9332802295684814
+    },
+    "front_leg": "right",
+    "bowling_arm": "left",
+    "peak_wrist_speed_frame": null,
+    "analysis_window": {
+      "start_frame": 3,
+      "end_frame_exclusive": 13,
+      "frame_count": 10,
+      "selection_method": "best_pose_visibility",
+      "used_peak_wrist_fallback": false
+    },
+    "knee_brace_warning": true,
+    "trunk_tilt_warning": false,
+    "elbow_extension_screen": true,
+    "interpretation_note": "Angles use MediaPipe pose_world_landmarks in estimated meters. The ten-frame peak-wrist window is a fallback when exact foot-contact frames are unavailable. Elbow extension above 15 degrees is only a video screen; it is not an official legality measurement or medical assessment."
   },
+  "joint_angle_series_columns": [
+    "left_knee_included_angle_deg",
+    "right_knee_included_angle_deg",
+    "left_elbow_included_angle_deg",
+    "right_elbow_included_angle_deg",
+    "lateral_trunk_tilt_deg"
+  ],
   "injury_screen": {
-    "hip_shoulder_separation_peak_deg": null,
-    "separation_warning": null,
-    "mixed_action_screen": null,
+    "hip_shoulder_separation_peak_deg": 135.2999267578125,
+    "separation_warning": true,
+    "mixed_action_screen": false,
     "status": "screening_only_not_medical_advice"
   },
-  "digital_twin_visualization": {
-    "status": "unavailable",
-    "reason": "This frame lacks complete 3D coordinates."
-  },
+  "digital_twin_visualization": "C:\\Users\\srip4\\Cricket-Project-\\data\\sliced_clips\\digital_twin\\delivery_001_pose.html",
   "ball_physics": {
     "release_speed_kmh": null,
     "pitch_track_status": "image_to_ground_plane_projection_only",
@@ -99,9 +158,24 @@
     "note": "A ground-plane homography cannot recover airborne ball depth or metric release speed."
   },
   "coach": {
-    "feedback": "No configured screening threshold was conclusively crossed; review the clip and confirm the pose estimate.",
+    "feedback": {
+      "root_cause_diagnosis": "Minimum estimated front-knee angle in the analysis window: 124.5 degrees. Minimum estimated bowling-elbow included angle: 108.8 degrees. Maximum estimated elbow extension: 71.2 degrees. Maximum estimated lateral trunk tilt: 3.9 degrees. The estimated front-knee angle was below the configured screening threshold; review the landing frame. The estimated elbow extension crossed the 15-degree screening threshold; this is not a legality decision. Hip-shoulder separation crossed the configured screening threshold; this is not an injury prediction.",
+      "priority_fix": "Prioritize a repeatable, balanced action and review the delivery from the same camera angle before changing mechanics.",
+      "prescribed_net_drill": "For the next six deliveries, bowl at comfortable effort while a partner records side-on video; review front-knee position, trunk alignment, and the release frame after each ball."
+    },
+    "report": {
+      "root_cause_diagnosis": "Minimum estimated front-knee angle in the analysis window: 124.5 degrees. Minimum estimated bowling-elbow included angle: 108.8 degrees. Maximum estimated elbow extension: 71.2 degrees. Maximum estimated lateral trunk tilt: 3.9 degrees. The estimated front-knee angle was below the configured screening threshold; review the landing frame. The estimated elbow extension crossed the 15-degree screening threshold; this is not a legality decision. Hip-shoulder separation crossed the configured screening threshold; this is not an injury prediction.",
+      "priority_fix": "Prioritize a repeatable, balanced action and review the delivery from the same camera angle before changing mechanics.",
+      "prescribed_net_drill": "For the next six deliveries, bowl at comfortable effort while a partner records side-on video; review front-knee position, trunk alignment, and the release frame after each ball."
+    },
     "observations": [
-      "No configured screening threshold was conclusively crossed; review the clip and confirm the pose estimate."
+      "Minimum estimated front-knee angle in the analysis window: 124.5 degrees.",
+      "Minimum estimated bowling-elbow included angle: 108.8 degrees.",
+      "Maximum estimated elbow extension: 71.2 degrees.",
+      "Maximum estimated lateral trunk tilt: 3.9 degrees.",
+      "The estimated front-knee angle was below the configured screening threshold; review the landing frame.",
+      "The estimated elbow extension crossed the 15-degree screening threshold; this is not a legality decision.",
+      "Hip-shoulder separation crossed the configured screening threshold; this is not an injury prediction."
     ],
     "retrieved_context": [],
     "generated_by": "deterministic_local_rules",

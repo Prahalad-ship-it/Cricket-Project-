@@ -16,6 +16,16 @@ BALL_CONFIDENCE_THRESHOLD = 0.2
 REFERENCE_FRAME_HEIGHT_PX = 720.0
 MIN_BALL_FIT_DETECTIONS = 3
 MIN_EVENT_FRAMES = 2
+KINEMATICS_PEAK_WINDOW_FRAMES = 10
+MEDIAPIPE_MODEL_COMPLEXITY = 2
+MEDIAPIPE_MIN_DETECTION_CONFIDENCE = 0.5
+MEDIAPIPE_MIN_TRACKING_CONFIDENCE = 0.5
+EVENT_EXACT_CONFIDENCE_THRESHOLD = 0.8
+NVIDIA_API_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_COACH_MODEL = "meta/muse-glimmer-30b"
+NVIDIA_COACH_TEMPERATURE = 0.4
+NVIDIA_COACH_TOP_P = 0.95
+NVIDIA_COACH_MAX_TOKENS = 1024
 
 OUTPUT_WIDTH_PX = 1280
 OUTPUT_HEIGHT_PX = 720
@@ -62,6 +72,27 @@ RIGHT_KNEE = 14
 LEFT_ANKLE = 15
 RIGHT_ANKLE = 16
 KEYPOINT_COUNT = 17
+
+# MediaPipe Pose landmark indices corresponding to the COCO keypoint order above.
+MEDIAPIPE_COCO_LANDMARK_INDICES = (
+    0,
+    2,
+    5,
+    7,
+    8,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+)
 
 # These are coaching-screening thresholds, not medical or legal diagnoses.
 KNEE_BRACE_MIN_ANGLE_DEG = 150.0
