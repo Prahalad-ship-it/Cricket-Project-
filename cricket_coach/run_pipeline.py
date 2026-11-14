@@ -5,7 +5,14 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from cricket_coach.config import PipelinePaths
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    pass
+else:
+    load_dotenv()
+
+from cricket_coach.config import OUTPUT_HEIGHT_PX, OUTPUT_WIDTH_PX, PipelinePaths
 from cricket_coach.phase1_capture.calibrator import PitchCalibrator
 from cricket_coach.phase1_capture.slicer import DeliverySlicer
 from cricket_coach.phase2_tracking.ball_tracker import BallTracker
@@ -18,6 +25,7 @@ from cricket_coach.phase4_digital_twin.pro_comparator import ProComparator
 from cricket_coach.phase4_digital_twin.visualizer_3d import SkeletonVisualizer
 from cricket_coach.phase5_ai_coach.rag_coach import RAGCoach
 from cricket_coach.data_contract import load_phase_payload, save_phase_payload
+from cricket_coach.training.mechanics_model import predict_active_mechanics
 
 LOGGER = logging.getLogger(__name__)
 
@@ -88,8 +96,59 @@ def run_pipeline(
                         metadata["phase_status"] = {**metadata.get("phase_status", {}), "visualization": "unavailable"}
                         save_phase_payload(metadata_path, metadata, arrays)
                 BallPhysicsAnalyzer().process(metadata_path)
-                coach_module.process(metadata_path)
-                metadata, _ = load_phase_payload(metadata_path)
+                metadata, arrays = load_phase_payload(metadata_path)
+                try:
+                    learned_mechanics = (
+                        predict_active_mechanics(
+                            arrays["poses_2d"],
+                            OUTPUT_WIDTH_PX,
+                            OUTPUT_HEIGHT_PX,
+                        )
+                        if "poses_2d" in arrays
+                        else None
+                    )
+                except (ImportError, OSError, RuntimeError, ValueError) as error:
+                    phase_errors = metadata.get("phase_errors")
+                    phase_errors = dict(phase_errors) if isinstance(phase_errors, dict) else {}
+                    phase_errors["learned_mechanics"] = f"{type(error).__name__}: {error}"
+                    metadata["phase_errors"] = phase_errors
+                    metadata["phase_status"] = {
+                        **metadata.get("phase_status", {}),
+                        "learned_mechanics": "error",
+                    }
+                    metadata["learned_mechanics"] = {"status": "error"}
+                    save_phase_payload(metadata_path, metadata, arrays)
+                    LOGGER.error(
+                        "Learned mechanics inference failed for %s: %s",
+                        clip_path,
+                        phase_errors["learned_mechanics"],
+                    )
+                else:
+                    metadata["learned_mechanics"] = (
+                        learned_mechanics or {"status": "not_trained"}
+                    )
+                    metadata["phase_status"] = {
+                        **metadata.get("phase_status", {}),
+                        "learned_mechanics": (
+                            "complete" if learned_mechanics else "not_trained"
+                        ),
+                    }
+                    save_phase_payload(metadata_path, metadata, arrays)
+                try:
+                    metadata, _ = coach_module.process(metadata_path)
+                except Exception as error:
+                    metadata, arrays = load_phase_payload(metadata_path)
+                    phase_errors = metadata.get("phase_errors")
+                    phase_errors = dict(phase_errors) if isinstance(phase_errors, dict) else {}
+                    phase_errors["coach"] = f"{type(error).__name__}: {error}"
+                    metadata["phase_errors"] = phase_errors
+                    metadata["phase_status"] = {
+                        **metadata.get("phase_status", {}),
+                        "coach": "error",
+                    }
+                    save_phase_payload(metadata_path, metadata, arrays)
+                    LOGGER.error("Coach phase failed for %s: %s", clip_path, phase_errors["coach"])
+                    raise
             except ImportError as error:
                 metadata, arrays = load_phase_payload(metadata_path)
                 metadata["analysis_warning"] = str(error)

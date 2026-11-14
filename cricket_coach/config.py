@@ -1,7 +1,15 @@
 """Centralized pipeline settings and thresholds."""
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    pass
+else:
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 ICC_CREASE_WIDTH_M = 2.64
 ICC_CREASE_DEPTH_M = 1.22
@@ -25,7 +33,7 @@ NVIDIA_API_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_COACH_MODEL = "meta/muse-glimmer-30b"
 NVIDIA_COACH_TEMPERATURE = 0.4
 NVIDIA_COACH_TOP_P = 0.95
-NVIDIA_COACH_MAX_TOKENS = 1024
+NVIDIA_COACH_MAX_TOKENS = 1500
 
 OUTPUT_WIDTH_PX = 1280
 OUTPUT_HEIGHT_PX = 720
@@ -52,7 +60,12 @@ CALIBRATION_MIN_QUADRILATERAL_AREA_RATIO = 0.005
 CALIBRATION_MAX_CANDIDATE_LINES_PER_FAMILY = 8
 CALIBRATION_MIN_INTERSECTION_DETERMINANT = 1e-6
 CALIBRATION_IDENTITY_MATRIX_TOLERANCE = 1e-8
-MODEL_POSE_PATH = "yolov8n-pose.pt"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_ACTIVE_POSE_MODEL_PATH = _PROJECT_ROOT / "models" / "pose" / "active.pt"
+MODEL_POSE_PATH = os.environ.get(
+    "CRICKET_POSE_MODEL_PATH",
+    str(_ACTIVE_POSE_MODEL_PATH) if _ACTIVE_POSE_MODEL_PATH.is_file() else "yolov8n-pose.pt",
+)
 MODEL_BALL_PATH = "tracknetv3.pt"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 ALLOWED_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".m4v"})

@@ -1,14 +1,39 @@
 """Streamlit dashboard for previously analyzed cricket delivery clips."""
 
+import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from cricket_coach.config import POSE_CONFIDENCE_THRESHOLD
 from cricket_coach.data_contract import load_phase_payload
+from cricket_coach.training.mechanics_model import (
+    mechanics_training_readiness,
+    predict_active_mechanics,
+    train_mechanics_model,
+)
+from cricket_coach.training.pose_dataset import (
+    MIN_PLAYER_GROUPS,
+    MIN_POSE_REVIEWS,
+    export_reviewed_pose_dataset,
+)
+from cricket_coach.training.review_store import (
+    KEYPOINT_NAMES,
+    MECHANICS_LABELS,
+    PLAYER_ROLES,
+    list_reviews,
+    review_stats,
+    save_review,
+)
+from cricket_coach.training.train_pose import train_pose_model
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DELIVERY_DIR = PROJECT_ROOT / "data" / "sliced_clips" / "deliveries"
 SKELETON_BONES = (
     (5, 6),
@@ -60,8 +85,16 @@ def _format_metric(value: Any, suffix: str = "") -> str:
 def _render_skeleton(st: Any, arrays: dict[str, np.ndarray], selected_frame: int = 0) -> None:
     """Render the best available 3D pose, falling back to a clearly labeled 2D view."""
     poses_3d = arrays.get("poses_3d")
+    fallback_frames = arrays.get("pose_3d_fallback_frames")
+    frame_uses_2d_fallback = (
+        fallback_frames is not None
+        and fallback_frames.ndim == 1
+        and 0 <= selected_frame < len(fallback_frames)
+        and bool(fallback_frames[selected_frame])
+    )
     if (
-        poses_3d is not None
+        not frame_uses_2d_fallback
+        and poses_3d is not None
         and poses_3d.ndim == 3
         and len(poses_3d)
         and poses_3d.shape[1] >= 17
@@ -102,9 +135,12 @@ def _render_skeleton(st: Any, arrays: dict[str, np.ndarray], selected_frame: int
     if int(available[frame_index]) < 3:
         frame_index = int(np.argmax(available))
     _render_2d_pose(st, pose_points_2d[frame_index], frame_index, len(poses_2d))
-    st.caption(
-        "Showing a 2D pose preview because 3D landmarks were unavailable for this delivery."
-    )
+    if frame_uses_2d_fallback:
+        st.caption("Showing YOLOv8 2D keypoints because 3D landmarks were unavailable.")
+    else:
+        st.caption(
+            "Showing a 2D pose preview because 3D landmarks were unavailable for this delivery."
+        )
 
 
 def _render_3d_pose(st: Any, frame: np.ndarray, frame_index: int, frame_count: int) -> None:
@@ -195,6 +231,586 @@ def _render_2d_pose(st: Any, frame: np.ndarray, frame_index: int, frame_count: i
     st.plotly_chart(figure, width="stretch")
 
 
+def _needs_pipeline_diagnostics(metadata: dict[str, Any]) -> bool:
+    """Open diagnostics automatically when one or more biomechanics values are unavailable."""
+    biomechanics = metadata.get("biomechanics", {})
+    if not isinstance(biomechanics, dict):
+        return True
+    metric_fields = (
+        (
+            biomechanics.get("front_knee_angle_deg", biomechanics.get("knee_angle_deg", {})),
+            "min",
+        ),
+        (
+            biomechanics.get("bowling_elbow_angle_deg", biomechanics.get("elbow_angle_deg", {})),
+            "min",
+        ),
+        (
+            biomechanics.get("lateral_trunk_tilt_deg", biomechanics.get("trunk_tilt_deg", {})),
+            "max",
+        ),
+        (biomechanics.get("bowling_elbow_extension_deg", {}), "max"),
+    )
+    return any(
+        not isinstance(summary, dict) or _format_metric(summary.get(key)) == "N/A"
+        for summary, key in metric_fields
+    )
+
+
+def _render_pipeline_health(st: Any, metadata: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
+    """Expose saved pipeline status and pose errors without opening the metadata JSON."""
+    pose_count = metadata.get("pose_3d_valid_frame_count")
+    if not isinstance(pose_count, (int, np.integer)):
+        poses_3d = arrays.get("poses_3d")
+        if poses_3d is not None and poses_3d.ndim == 3 and poses_3d.shape[2] >= 3:
+            landmark_counts = np.isfinite(poses_3d[..., :3]).all(axis=-1).sum(axis=1)
+            pose_count = int((landmark_counts >= 3).sum())
+        else:
+            pose_count = "N/A"
+
+    coach = metadata.get("coach")
+    coach = coach if isinstance(coach, dict) else {}
+    phase_status = metadata.get("phase_status")
+    phase_status = phase_status if isinstance(phase_status, dict) else {}
+    phase_errors = metadata.get("phase_errors")
+    phase_errors = phase_errors if isinstance(phase_errors, dict) else {}
+    with st.expander(
+        "Pipeline Health & Debug Status",
+        expanded=_needs_pipeline_diagnostics(metadata) or bool(phase_errors),
+    ):
+        st.write("Phase status")
+        st.json(phase_status)
+        st.metric("Valid pose frames", pose_count)
+        st.write("Pose status", metadata.get("pose_status", "not recorded"))
+        st.write("Coach generated by", coach.get("generated_by", "not recorded"))
+        if phase_errors:
+            st.error("Pipeline errors or fallbacks were recorded.")
+            st.json(phase_errors)
+        else:
+            st.success("No pipeline errors recorded.")
+        if metadata.get("pose_3d_fallback_frame_count"):
+            st.warning(
+                f"2D keypoints were used as fallback in "
+                f"{metadata['pose_3d_fallback_frame_count']} frame(s)."
+            )
+
+
+def _read_review_frame(video_path: Path, frame_index: int) -> tuple[np.ndarray, int, int]:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError(f"Unable to open the saved delivery video: {video_path}")
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise ValueError(f"Unable to decode frame {frame_index + 1} for annotation.")
+        height, width = frame.shape[:2]
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), width, height
+    finally:
+        capture.release()
+
+
+def _draw_review_keypoints(frame: np.ndarray, pose: np.ndarray) -> np.ndarray:
+    preview = frame.copy()
+    height, width = frame.shape[:2]
+
+    def image_point(point: np.ndarray) -> tuple[int, int]:
+        clipped = np.clip(np.rint(point), (0, 0), (width - 1, height - 1)).astype(int)
+        return int(clipped[0]), int(clipped[1])
+
+    for first, second in SKELETON_BONES:
+        endpoints = pose[[first, second], :2]
+        if np.isfinite(endpoints).all():
+            start = image_point(endpoints[0])
+            end = image_point(endpoints[1])
+            cv2.line(preview, start, end, (0, 255, 0), 2)
+    for point in pose:
+        if np.isfinite(point[:2]).all():
+            center = image_point(point[:2])
+            cv2.circle(preview, center, 4, (255, 200, 0), -1)
+    return preview
+
+
+def _draw_person_candidates(
+    frame: np.ndarray,
+    boxes: np.ndarray,
+    selected_index: int,
+    pose: np.ndarray,
+) -> np.ndarray:
+    preview = frame.copy()
+    height, width = frame.shape[:2]
+    for index, box in enumerate(boxes):
+        if not np.isfinite(box).all():
+            continue
+        x1, y1, x2, y2 = np.rint(box).astype(int)
+        x1, x2 = np.clip((x1, x2), 0, width - 1)
+        y1, y2 = np.clip((y1, y2), 0, height - 1)
+        color = (0, 255, 0) if index == selected_index else (255, 200, 0)
+        cv2.rectangle(preview, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            preview,
+            f"Person {index + 1}",
+            (x1, max(18, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    return _draw_review_keypoints(preview, pose)
+
+
+def _history_rows(reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for review in reviews:
+        metrics = review.get("metrics", {})
+        knee = metrics.get("front_knee_angle_deg", {})
+        trunk = metrics.get("lateral_trunk_tilt_deg", {})
+        rows.append(
+            {
+                "date": review["created_at"][:10],
+                "delivery": review["delivery_id"],
+                "frame": int(review["frame_index"]) + 1,
+                "person role": review.get("player_role", "unknown"),
+                "mechanics tags": ", ".join(review["mechanics_labels"]),
+                "coach rating": review["coach_rating"],
+                "drill completed": review["drill_completed"],
+                "drill helpful": review.get("drill_helpful"),
+                "prescribed drill": review.get("drill_text", ""),
+                "front knee min (deg)": knee.get("min"),
+                "trunk tilt max (deg)": trunk.get("max"),
+            }
+        )
+    return rows
+
+
+def _render_training_review(
+    st: Any,
+    metadata_path: Path,
+    metadata: dict[str, Any],
+    arrays: dict[str, np.ndarray],
+    video_path: Path,
+    selected_frame: int,
+) -> None:
+    """Capture human-reviewed pose labels, coaching feedback, and player history."""
+    with st.expander("Training data review & player progress", expanded=False):
+        st.caption(
+            "Corrections are saved locally for supervised batch training. "
+            "Nothing updates model weights automatically."
+        )
+        st.info(
+            "Choosing a detected person and labeling their role saves feedback for future "
+            "person-selection training. It does not change this delivery's existing "
+            "biomechanics or automatically retrain a model."
+        )
+        st.info(
+            "Only review videos you have permission to use. Enter an anonymous ID, not a person's name. "
+            "This tool is not a medical assessment or an official action-legality test."
+        )
+        try:
+            stats = review_stats()
+        except (OSError, RuntimeError, sqlite3.Error) as error:
+            st.error(f"Could not read the local review database: {error}")
+            return
+        columns = st.columns(3)
+        columns[0].metric("Reviewed frames", stats["reviews"])
+        columns[1].metric("Anonymous players", stats["players"])
+        columns[2].metric("Mechanics-tagged examples", stats["tagged_reviews"])
+        st.caption(
+            f"Pose fine-tuning stays disabled until at least {MIN_POSE_REVIEWS} reviewed frames "
+            f"from {MIN_PLAYER_GROUPS} different player IDs are available."
+        )
+        st.subheader("Train and evaluate models")
+        st.caption(
+            "Training runs locally only when you click a button. Candidates are not promoted "
+            "unless you opt in and validation improves; the test split is report-only."
+        )
+        pose_ready = (
+            stats["reviews"] >= MIN_POSE_REVIEWS
+            and stats["players"] >= MIN_PLAYER_GROUPS
+        )
+        pose_epochs = st.number_input(
+            "Pose model epochs",
+            min_value=1,
+            max_value=200,
+            value=30,
+            step=5,
+            key="pose-training-epochs",
+        )
+        promote_pose = st.checkbox(
+            "Promote pose candidate if validation improves (test remains report-only)",
+            key="promote-pose-candidate",
+        )
+        if st.button("Train/evaluate pose model", disabled=not pose_ready):
+            dataset_root = Path("data") / "training"
+            version = 1
+            while (dataset_root / f"pose_dataset_v{version}").exists():
+                version += 1
+            dataset_path = dataset_root / f"pose_dataset_v{version}"
+            try:
+                with st.spinner("Exporting reviewed frames and training the pose model..."):
+                    dataset = export_reviewed_pose_dataset(dataset_path)
+                    training_report = train_pose_model(
+                        dataset_yaml=dataset["dataset_yaml"],
+                        epochs=int(pose_epochs),
+                        promote=promote_pose,
+                    )
+            except (ImportError, OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                st.error(f"Pose training did not complete: {type(error).__name__}: {error}")
+            else:
+                st.success(
+                    "Pose candidate trained. "
+                    + ("Promoted for future pipeline runs." if training_report["promoted"] else "Baseline model remains active.")
+                )
+                st.json(training_report["metrics"])
+
+        try:
+            mechanics_readiness = mechanics_training_readiness()
+        except (OSError, RuntimeError, sqlite3.Error) as error:
+            st.error(f"Could not check mechanics-label coverage: {error}")
+            mechanics_readiness = {"ready": False, "counts": {}, "player_counts": {}}
+        if mechanics_readiness["counts"]:
+            st.dataframe(
+                [
+                    {
+                        "mechanics tag": label,
+                        "reviewed deliveries": count,
+                        "player IDs": mechanics_readiness["player_counts"][label],
+                        "minimum examples": mechanics_readiness["minimum_examples_per_label"],
+                        "trainable": label in mechanics_readiness["ready_labels"],
+                    }
+                    for label, count in mechanics_readiness["counts"].items()
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        mechanics_epochs = st.number_input(
+            "Mechanics model epochs",
+            min_value=1,
+            max_value=300,
+            value=100,
+            step=10,
+            key="mechanics-training-epochs",
+        )
+        promote_mechanics = st.checkbox(
+            "Promote mechanics model if validation improves (test remains report-only)",
+            key="promote-mechanics-candidate",
+        )
+        if st.button(
+            "Train/evaluate mechanics model",
+            disabled=not mechanics_readiness["ready"],
+        ):
+            try:
+                with st.spinner("Training the reviewed-delivery sequence model..."):
+                    training_report = train_mechanics_model(
+                        epochs=int(mechanics_epochs),
+                        promote=promote_mechanics,
+                    )
+            except (ImportError, OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                st.error(f"Mechanics training did not complete: {type(error).__name__}: {error}")
+            else:
+                st.success(
+                    "Mechanics candidate trained. "
+                    + ("Promoted for future pipeline runs." if training_report["promoted"] else "No model was promoted.")
+                )
+                st.json(training_report["metrics"])
+
+        poses_2d = arrays.get("poses_2d")
+        if (
+            poses_2d is None
+            or poses_2d.ndim != 3
+            or len(poses_2d) == 0
+            or poses_2d.shape[1] < len(KEYPOINT_NAMES)
+        ):
+            st.warning("This delivery has no editable 2D keypoints, so it cannot add a pose training example.")
+        elif not video_path.is_file():
+            st.warning("The saved clip is missing; a frame cannot be reviewed or labeled.")
+        else:
+            frame_index = min(max(selected_frame, 0), len(poses_2d) - 1)
+            try:
+                frame_image, image_width, image_height = _read_review_frame(video_path, frame_index)
+            except (OSError, ValueError, cv2.error) as error:
+                st.error(f"Could not load the frame for review: {error}")
+                frame_image = None
+
+            if frame_image is not None:
+                candidate_poses = arrays.get("poses_2d_candidates")
+                candidate_boxes = arrays.get("person_boxes_xyxy")
+                candidate_counts = arrays.get("person_candidate_counts")
+                candidate_count = 0
+                if (
+                    candidate_poses is not None
+                    and candidate_poses.ndim == 4
+                    and candidate_poses.shape[0] == len(poses_2d)
+                    and candidate_poses.shape[2] >= len(KEYPOINT_NAMES)
+                    and candidate_boxes is not None
+                    and candidate_boxes.ndim == 3
+                    and candidate_boxes.shape[:2] == candidate_poses.shape[:2]
+                    and candidate_counts is not None
+                    and candidate_counts.ndim == 1
+                    and frame_index < len(candidate_counts)
+                ):
+                    candidate_count = min(
+                        int(candidate_counts[frame_index]),
+                        candidate_poses.shape[1],
+                        candidate_boxes.shape[1],
+                    )
+
+                selected_person_index: int | None = None
+                person_box: np.ndarray | None = None
+                if candidate_count:
+                    selected_person_index = st.selectbox(
+                        "Person to label in this frame",
+                        options=list(range(candidate_count)),
+                        format_func=lambda index: (
+                            f"Person {index + 1}"
+                            + (" (largest detection)" if index == 0 else "")
+                        ),
+                        help=(
+                            "Choose the box around the bowler. Detection order is by box size "
+                            "for this frame only and may change in another frame."
+                        ),
+                        key=(
+                            f"review-person-{metadata.get('delivery_id', metadata_path.stem)}-"
+                            f"{frame_index}"
+                        ),
+                    )
+                    pose = candidate_poses[frame_index, selected_person_index]
+                    person_box = candidate_boxes[frame_index, selected_person_index]
+                    review_preview = _draw_person_candidates(
+                        frame_image,
+                        candidate_boxes[frame_index, :candidate_count],
+                        selected_person_index,
+                        pose,
+                    )
+                    st.caption(
+                        "Choose the highlighted person deliberately; the automatic pose may "
+                        "have selected a different player."
+                    )
+                    if selected_person_index != 0:
+                        st.caption(
+                            "Biomechanics values below were computed from the automatic "
+                            "largest-person selection, not this manually selected person."
+                        )
+                else:
+                    pose = poses_2d[frame_index]
+                    review_preview = _draw_review_keypoints(frame_image, pose)
+                    st.warning(
+                        "This clip has no saved per-person detections. Re-run the pipeline "
+                        "with the current version to manually choose among detected people."
+                    )
+                st.image(
+                    review_preview,
+                    caption=f"Frame {frame_index + 1}; edit the selected person's keypoints below.",
+                    use_container_width=True,
+                )
+                editor_rows = []
+                for index, name in enumerate(KEYPOINT_NAMES):
+                    x, y = float(pose[index, 0]), float(pose[index, 1])
+                    confidence = (
+                        float(pose[index, 2])
+                        if pose.shape[1] >= 3 and np.isfinite(pose[index, 2])
+                        else None
+                    )
+                    point_is_finite = np.isfinite((x, y)).all()
+                    editor_rows.append(
+                        {
+                            "index": index,
+                            "keypoint": name,
+                            "x_px": round(x, 2) if point_is_finite else None,
+                            "y_px": round(y, 2) if point_is_finite else None,
+                            "visible": bool(
+                                point_is_finite
+                                and (confidence is None or confidence >= POSE_CONFIDENCE_THRESHOLD)
+                            ),
+                            "model confidence": round(confidence, 3) if confidence is not None else None,
+                        }
+                    )
+
+                with st.form(key=f"review-form-{metadata.get('delivery_id', metadata_path.stem)}-{frame_index}"):
+                    player_id = st.text_input(
+                        "Anonymous player ID",
+                        placeholder="player_001",
+                        help="Use a stable alias such as player_001; do not enter a person's name.",
+                    )
+                    role_labels = {
+                        "bowler": "Bowler",
+                        "batter": "Batter",
+                        "wicketkeeper": "Wicketkeeper",
+                        "other": "Other",
+                    }
+                    player_role = st.selectbox(
+                        "Selected person's role",
+                        options=PLAYER_ROLES,
+                        format_func=lambda role: role_labels[role],
+                        index=0,
+                        help="This role label is saved as feedback for future person-selection training.",
+                        key=(
+                            f"review-role-{metadata.get('delivery_id', metadata_path.stem)}-"
+                            f"{frame_index}-{selected_person_index}"
+                        ),
+                    )
+                    consent = st.checkbox(
+                        "I have permission to use this player's video and labels for local analysis and training."
+                    )
+                    edited_keypoints = st.data_editor(
+                        editor_rows,
+                        num_rows="fixed",
+                        hide_index=True,
+                        use_container_width=True,
+                        disabled=["index", "keypoint", "model confidence"],
+                        key=(
+                            f"keypoints-{metadata.get('delivery_id', metadata_path.stem)}-"
+                            f"{frame_index}-{selected_person_index}"
+                        ),
+                    )
+                    mechanics_labels = st.multiselect(
+                        "Coach-reviewed mechanics tags (optional)",
+                        MECHANICS_LABELS,
+                        help=(
+                            "Use descriptive technique observations, not legal or medical diagnoses. "
+                            "The 'other' tag is stored but is not a mechanics-model training class."
+                        ),
+                    )
+                    rating_choice = st.selectbox(
+                        "How helpful was the coach feedback?",
+                        ("Not rated", "1", "2", "3", "4", "5"),
+                        key=f"coach-rating-{metadata.get('delivery_id', metadata_path.stem)}-{frame_index}",
+                    )
+                    drill_completed = st.checkbox("Player completed the prescribed drill.")
+                    helpful_choice = st.selectbox(
+                        "If completed, was the drill helpful?",
+                        ("Not rated", "Yes", "No"),
+                        disabled=not drill_completed,
+                        key=f"drill-helpful-{metadata.get('delivery_id', metadata_path.stem)}-{frame_index}",
+                    )
+                    notes = st.text_area("Review notes (optional; do not include personal or medical details).")
+                    submitted = st.form_submit_button("Save reviewed example")
+
+                if submitted:
+                    rating = int(rating_choice) if rating_choice != "Not rated" else None
+                    drill_helpful = (
+                        helpful_choice == "Yes"
+                        if drill_completed and helpful_choice != "Not rated"
+                        else None
+                    )
+                    coach = metadata.get("coach", {})
+                    coach_report = coach.get("report", coach.get("feedback", {}))
+                    drill_text = (
+                        coach_report.get("prescribed_net_drill", "")
+                        if isinstance(coach_report, dict)
+                        else ""
+                    )
+                    try:
+                        review_metrics = (
+                            metadata.get("biomechanics", {})
+                            if selected_person_index in (None, 0)
+                            else {}
+                        )
+                        review_id = save_review(
+                            player_id=player_id,
+                            delivery_id=str(metadata.get("delivery_id", metadata_path.stem)),
+                            metadata_path=metadata_path,
+                            video_path=video_path,
+                            frame_index=frame_index,
+                            image_width=image_width,
+                            image_height=image_height,
+                            keypoint_rows=edited_keypoints,
+                            mechanics_labels=mechanics_labels,
+                            coach_rating=rating,
+                            drill_completed=drill_completed,
+                            drill_helpful=drill_helpful,
+                            notes=notes,
+                            metrics=review_metrics,
+                            consent_confirmed=consent,
+                            drill_text=drill_text,
+                            player_role=player_role,
+                            person_detection_index=selected_person_index,
+                            person_box=person_box,
+                        )
+                    except (OSError, PermissionError, ValueError, sqlite3.Error) as error:
+                        st.error(f"Could not save this reviewed example: {error}")
+                    else:
+                        st.success(f"Saved reviewed example {review_id[:8]}.")
+
+        history_player_id = st.text_input(
+            "View history for anonymous player ID",
+            key="player-history-id",
+        ).strip()
+        if history_player_id:
+            try:
+                reviews = list_reviews(player_id=history_player_id, limit=1000)
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                st.error(f"Could not load player history: {error}")
+            else:
+                latest_by_delivery: dict[tuple[str, str], dict[str, Any]] = {}
+                for review in reviews:
+                    history_key = (review["metadata_path"], review["delivery_id"])
+                    if history_key not in latest_by_delivery:
+                        latest_by_delivery[history_key] = review
+                history = list(latest_by_delivery.values())
+                if history:
+                    completed_drills = sum(review["drill_completed"] for review in history)
+                    rated_drills = [
+                        review for review in history if review["drill_helpful"] is not None
+                    ]
+                    summary_columns = st.columns(2)
+                    summary_columns[0].metric(
+                        "Drills completed",
+                        f"{completed_drills}/{len(history)}",
+                    )
+                    if rated_drills:
+                        helpful_drills = sum(review["drill_helpful"] for review in rated_drills)
+                        summary_columns[1].metric(
+                            "Drills rated helpful",
+                            f"{helpful_drills}/{len(rated_drills)}",
+                        )
+                    else:
+                        summary_columns[1].metric("Drills rated helpful", "Not rated yet")
+                    rated_by_drill: dict[str, list[bool]] = {}
+                    for review in history:
+                        drill = review.get("drill_text", "").strip()
+                        if drill and review["drill_helpful"] is not None:
+                            rated_by_drill.setdefault(drill, []).append(review["drill_helpful"])
+                    consistent_drills = [
+                        (text, outcomes)
+                        for text, outcomes in rated_by_drill.items()
+                        if len(outcomes) >= 3
+                    ]
+                    if consistent_drills:
+                        best_drill, outcomes = max(
+                            consistent_drills,
+                            key=lambda item: (sum(item[1]) / len(item[1]), len(item[1])),
+                        )
+                        st.info(
+                            f"Your highest-rated saved drill was marked helpful "
+                            f"{sum(outcomes)}/{len(outcomes)} times: {best_drill}"
+                        )
+                    trend_rows = []
+                    for review in reversed(history):
+                        metrics = review.get("metrics", {})
+                        knee_value = metrics.get("front_knee_angle_deg", {}).get("min")
+                        trunk_value = metrics.get("lateral_trunk_tilt_deg", {}).get("max")
+                        if knee_value is not None or trunk_value is not None:
+                            trend_rows.append(
+                                {
+                                    "session": review["created_at"][:10],
+                                    "front knee min (deg)": knee_value,
+                                    "trunk tilt max (deg)": trunk_value,
+                                }
+                            )
+                    if trend_rows:
+                        st.line_chart(
+                            trend_rows,
+                            x="session",
+                            y=["front knee min (deg)", "trunk tilt max (deg)"],
+                        )
+                    st.dataframe(_history_rows(history), use_container_width=True, hide_index=True)
+                else:
+                    st.info("No reviewed sessions are saved for this anonymous player ID yet.")
+
+
 def _render_dashboard(st: Any, metadata_path: Path) -> None:
     """Load one delivery contract and render the video and analysis cards."""
     try:
@@ -210,6 +826,8 @@ def _render_dashboard(st: Any, metadata_path: Path) -> None:
         f"Frames: {metadata.get('frame_count', 'N/A')} | "
         f"Calibration: {metadata.get('calibration_status', 'unknown')}"
     )
+    st.caption("Displaying saved delivery analysis; opening this page does not rerun the pipeline.")
+    _render_pipeline_health(st, metadata, arrays)
 
     video_path = resolve_delivery_video(metadata_path, metadata)
     if video_path.is_file():
@@ -238,6 +856,8 @@ def _render_dashboard(st: Any, metadata_path: Path) -> None:
             value=default_frame + 1,
             key=f"pose-frame-{delivery_id}",
         ) - 1
+
+    _render_training_review(st, metadata_path, metadata, arrays, video_path, selected_frame)
 
     st.subheader("Biomechanics")
     biomechanics = metadata.get("biomechanics", {})
@@ -293,18 +913,37 @@ def _render_dashboard(st: Any, metadata_path: Path) -> None:
     window = biomechanics.get("analysis_window", {})
     if window:
         method = {
-            "exact_contact_frames": "Exact contact frames",
-            "peak_wrist_speed": "10-frame peak-wrist fallback",
-            "best_pose_visibility": "10-frame best-pose fallback (no valid wrist-speed peak)",
+            "peak_wrist_speed": "10-frame global peak-wrist window",
+            "no_valid_wrist_speed": "No valid wrist-speed peak; metrics unavailable",
         }.get(window.get("selection_method"), "Biomechanics analysis window")
         st.caption(
             f"{method}; frames {window.get('start_frame', 'N/A')}–"
             f"{max(window.get('start_frame', 0), window.get('end_frame_exclusive', 1) - 1)} | "
-            f"front leg: {biomechanics.get('front_leg', 'unknown')} | "
-            f"bowling arm: {biomechanics.get('bowling_arm', 'unknown')}"
+            f"front leg: {biomechanics.get('front_leg') or 'unknown'} | "
+            f"bowling arm: {biomechanics.get('bowling_arm') or 'unknown'}"
         )
     if biomechanics.get("interpretation_note"):
         st.caption(biomechanics["interpretation_note"])
+
+    learned_mechanics = metadata.get("learned_mechanics", {})
+    if isinstance(learned_mechanics, dict) and learned_mechanics.get("status") == "complete":
+        st.subheader("Learned mechanics suggestions")
+        probabilities = learned_mechanics.get("probabilities", {})
+        if probabilities:
+            st.dataframe(
+                [
+                    {"mechanics tag": label, "model confidence": float(score)}
+                    for label, score in probabilities.items()
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        st.caption(
+            "Experimental model predictions from reviewed examples; confirm them with a coach. "
+            "They are not legal, medical, or injury-risk conclusions."
+        )
+    elif isinstance(learned_mechanics, dict) and learned_mechanics.get("status") == "error":
+        st.warning("The trained mechanics model could not evaluate this delivery; see Pipeline Health.")
 
     st.subheader("Injury screening")
     injury = metadata.get("injury_screen", {})

@@ -1,4 +1,13 @@
 __pycache__/
 *.py[cod]
+*.pt
 .venv/
 venv/
+.env
+data/raw_sessions/
+data/sliced_clips/
+data/api_runs/
+data/training/
+models/pose/
+models/mechanics/
+runs/

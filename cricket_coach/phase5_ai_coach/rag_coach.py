@@ -73,8 +73,7 @@ class RAGCoach:
         try:
             from openai import OpenAI
         except ImportError as error:
-            LOGGER.warning("NVIDIA coaching disabled because OpenAI SDK is unavailable: %s", error)
-            return None
+            raise RuntimeError("NVIDIA coaching requires the OpenAI SDK.") from error
         return OpenAI(
             base_url=NVIDIA_API_BASE_URL,
             api_key=api_key,
@@ -123,14 +122,7 @@ class RAGCoach:
         else:
             context = self._retrieve(" ".join(observations))
 
-        if self.llm:
-            try:
-                feedback = self.llm(query, context)
-            except Exception as error:
-                LOGGER.warning("Configured coaching provider failed (%s); using rule-based coaching.", type(error).__name__)
-                feedback = None
-            generated_by = "configured_llm"
-        elif self.nvidia_client is not None:
+        if self.nvidia_client is not None:
             try:
                 response = self.nvidia_client.chat.completions.create(
                     model=NVIDIA_COACH_MODEL,
@@ -152,9 +144,21 @@ class RAGCoach:
                 feedback = response.choices[0].message.content
                 generated_by = NVIDIA_COACH_MODEL
             except Exception as error:
-                LOGGER.warning("NVIDIA coaching request failed (%s); using rule-based coaching.", type(error).__name__)
+                status_code = getattr(error, "status_code", None)
+                detail = (
+                    f"HTTP {status_code}"
+                    if isinstance(status_code, int)
+                    else type(error).__name__
+                )
+                LOGGER.error("NVIDIA coaching request failed: %s.", detail)
+                raise RuntimeError(f"NVIDIA coaching request failed: {detail}.") from None
+        elif self.llm:
+            try:
+                feedback = self.llm(query, context)
+            except Exception as error:
+                LOGGER.warning("Configured coaching provider failed (%s); using rule-based coaching.", type(error).__name__)
                 feedback = None
-                generated_by = "deterministic_local_rules"
+            generated_by = "configured_llm"
         else:
             feedback = None
             generated_by = "deterministic_local_rules"
@@ -166,6 +170,8 @@ class RAGCoach:
                 report = self._fallback_report(observations)
                 generated_by = "deterministic_local_rules"
         else:
+            if generated_by == NVIDIA_COACH_MODEL:
+                LOGGER.warning("NVIDIA coaching provider returned an empty report; using rule-based coaching.")
             report = self._fallback_report(observations)
             generated_by = "deterministic_local_rules"
 
@@ -228,6 +234,25 @@ class RAGCoach:
 
 
 if __name__ == "__main__":
-    result = RAGCoach().diagnose({"biomechanics": {}})
-    assert result["generated_by"] == "deterministic_local_rules"
+    from unittest.mock import Mock
+
+    client = Mock()
+    client.chat.completions.create.return_value.choices = [
+        Mock(
+            message=Mock(
+                content=json.dumps(
+                    {
+                        "root_cause_diagnosis": "Supported observation.",
+                        "priority_fix": "Use a balanced approach.",
+                        "prescribed_net_drill": "Record six comfortable deliveries.",
+                    }
+                )
+            )
+        )
+    ]
+    result = RAGCoach(client=client).diagnose({"biomechanics": {}})
+    request = client.chat.completions.create.call_args.kwargs
+    assert result["generated_by"] == NVIDIA_COACH_MODEL
+    assert request["model"] == NVIDIA_COACH_MODEL
+    assert request["max_tokens"] == NVIDIA_COACH_MAX_TOKENS
     print("Coaching checks passed.")
